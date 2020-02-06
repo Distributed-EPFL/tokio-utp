@@ -1,5 +1,6 @@
 use std::cmp::{max, min};
 use std::collections::VecDeque;
+use std::fmt;
 use std::future::Future;
 use std::io::{ErrorKind, Result};
 use std::iter::Iterator;
@@ -17,7 +18,7 @@ use crate::util::*;
 
 use rand;
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tokio::net::{lookup_host, ToSocketAddrs, UdpSocket};
 use tokio::sync::mpsc::{
     unbounded_channel, UnboundedReceiver, UnboundedSender,
@@ -563,7 +564,9 @@ impl UtpSocket {
 
         // only flush data that we acked (e.g. the packets are in order in the buffer)
         if !self.incoming_buffer.is_empty()
-            && (self.ack_nr.wrapping_sub(self.incoming_buffer[0].seq_nr()) >= 1)
+            && (self.ack_nr == self.incoming_buffer[0].seq_nr()
+                || self.ack_nr.wrapping_sub(self.incoming_buffer[0].seq_nr())
+                    >= 1)
         {
             let flushed =
                 unsafe_copy(&self.incoming_buffer[0].payload()[..], buf);
@@ -578,7 +581,7 @@ impl UtpSocket {
             return flushed;
         } else if !self.incoming_buffer.is_empty() {
             debug!(
-                "not flushing out of order data, acked={} > cached={}",
+                "not flushing out of order data, acked={} != cached={}",
                 self.ack_nr,
                 self.incoming_buffer[0].seq_nr()
             );
@@ -854,7 +857,7 @@ impl UtpSocket {
         let mut reply = self.prepare_reply(packet, PacketType::State);
         if packet.seq_nr().wrapping_sub(self.ack_nr) > 1 {
             debug!(
-                "current ack_nr ({}) is behind received packet seq_nr ({})",
+                "current ack_nr({}) is behind received packet seq_nr ({})",
                 self.ack_nr,
                 packet.seq_nr()
             );
@@ -863,6 +866,7 @@ impl UtpSocket {
             let sack = self.build_selective_ack();
 
             if !sack.is_empty() {
+                debug!("sending SACK to peer");
                 reply.set_sack(sack);
             }
         }
@@ -993,6 +997,7 @@ impl UtpSocket {
             let sack = self.build_selective_ack();
 
             if !sack.is_empty() {
+                debug!("sending SACK packet");
                 reply.set_sack(sack);
             }
         }
@@ -1890,6 +1895,69 @@ impl Future for UtpStreamDriver {
 impl Drop for UtpSocket {
     fn drop(&mut self) {
         let _ = self.close();
+    }
+}
+
+const MTU: usize = 1500;
+
+/// A buffered `UtpStream` to avoid making too many system calls when sending
+/// small amounts of data through utp
+pub struct BufferedUtpStream {
+    stream: BufReader<UtpStream>,
+}
+
+impl BufferedUtpStream {
+    /// Create a new `BufferedUtpStream` from an open `UtpStream`
+    pub fn new(stream: UtpStream) -> Self {
+        Self {
+            stream: BufReader::with_capacity(MTU, stream),
+        }
+    }
+
+    fn get_stream(self: Pin<&mut Self>) -> Pin<&mut BufReader<UtpStream>> {
+        unsafe { self.map_unchecked_mut(|s| &mut s.stream) }
+    }
+
+    /// Get the local address for this `BufferedUtpStream`
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        Ok(self.stream.get_ref().local_addr())
+    }
+
+    /// Get the peer address for this `BufferedUtpStream`
+    pub fn peer_addr(&self) -> Result<SocketAddr> {
+        Ok(self.stream.get_ref().peer_addr())
+    }
+}
+
+impl AsyncRead for BufferedUtpStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize>> {
+        // bypass buffering when reading since UtpStream already buffers
+        self.get_stream().get_pin_mut().poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for BufferedUtpStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &[u8],
+    ) -> Poll<Result<usize>> {
+        self.get_stream().poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<()>> {
+        self.get_stream().poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+    ) -> Poll<Result<()>> {
+        self.get_stream().poll_shutdown(cx)
     }
 }
 
@@ -2999,6 +3067,7 @@ mod test {
 
     #[tokio::test]
     async fn test_correct_packet_loss() {
+        init_logger();
         let server_addr = next_test_ip4();
 
         let mut server = iotry!(UtpSocket::bind(server_addr));
@@ -3006,30 +3075,33 @@ mod test {
         let data = (0..LEN).map(|idx| idx as u8).collect::<Vec<u8>>();
         let to_send = data.clone();
 
-        let handle = task::spawn(async move {
-            let mut client = iotry!(UtpSocket::connect(server_addr));
+        let handle = task::spawn(
+            async move {
+                let mut client = iotry!(UtpSocket::connect(server_addr));
 
-            // Send everything except the odd chunks
-            let chunks = to_send[..].chunks(BUF_SIZE);
-            let dst = client.connected_to;
-            for (index, chunk) in chunks.enumerate() {
-                let mut packet = Packet::with_payload(chunk);
-                packet.set_seq_nr(client.seq_nr);
-                packet.set_ack_nr(client.ack_nr);
-                packet.set_connection_id(client.sender_connection_id);
-                packet.set_timestamp(now_microseconds());
+                // Send everything except the odd chunks
+                let chunks = to_send[..].chunks(BUF_SIZE);
+                let dst = client.connected_to;
+                for (index, chunk) in chunks.enumerate() {
+                    let mut packet = Packet::with_payload(chunk);
+                    packet.set_seq_nr(client.seq_nr);
+                    packet.set_ack_nr(client.ack_nr);
+                    packet.set_connection_id(client.sender_connection_id);
+                    packet.set_timestamp(now_microseconds());
 
-                if index % 2 == 0 {
-                    iotry!(client.socket.send_to(packet.as_ref(), dst));
+                    if index % 2 == 0 {
+                        iotry!(client.socket.send_to(packet.as_ref(), dst));
+                    }
+
+                    client.curr_window += packet.len() as u32;
+                    client.send_window.push(packet);
+                    client.seq_nr += 1;
                 }
 
-                client.curr_window += packet.len() as u32;
-                client.send_window.push(packet);
-                client.seq_nr += 1;
+                iotry!(client.close());
             }
-
-            iotry!(client.close());
-        });
+            .instrument(debug_span!("sender")),
+        );
 
         let mut buf = [0; BUF_SIZE];
         let mut received: Vec<u8> = vec![];
@@ -3040,8 +3112,12 @@ mod test {
                 Err(e) => panic!("{}", e),
             }
         }
-        assert_eq!(received.len(), data.len());
-        assert_eq!(received, data);
+        assert_eq!(
+            received.len(),
+            data.len(),
+            "wrong number of bytes received"
+        );
+        assert_eq!(received, data, "incorrect data received");
         handle.await.expect("task failure");
     }
 
@@ -3216,6 +3292,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn test_receiving_reset_on_established_connection() {
         // Establish connection
         let server_addr = next_test_ip4();
