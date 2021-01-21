@@ -1,6 +1,5 @@
 use std::cmp::{max, min};
 use std::collections::VecDeque;
-use std::fmt;
 use std::future::Future;
 use std::io::{ErrorKind, Result};
 use std::iter::Iterator;
@@ -18,15 +17,13 @@ use crate::util::*;
 
 use rand;
 
-use tokio::io::{AsyncRead, AsyncWrite, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadBuf};
 use tokio::net::{lookup_host, ToSocketAddrs, UdpSocket};
 use tokio::sync::mpsc::{
     unbounded_channel, UnboundedReceiver, UnboundedSender,
 };
 use tokio::sync::Mutex;
-use tokio::time::{
-    delay_for, timeout, Delay as TokioDelay, Instant as TokioInstant,
-};
+use tokio::time::{sleep, timeout, Instant as TokioInstant, Sleep};
 
 use tracing::debug;
 
@@ -315,7 +312,9 @@ impl UtpSocket {
         self.state = SocketState::FinSent;
 
         // Receive JAKE
-        let mut buf = [0; BUF_SIZE];
+        let mut jbuf = [0; BUF_SIZE];
+        let mut buf: ReadBuf<'_> = ReadBuf::new(&mut jbuf);
+
         while self.state != SocketState::Closed {
             self.recv(&mut buf).await?;
         }
@@ -334,7 +333,8 @@ impl UtpSocket {
         &mut self,
         buf: &mut [u8],
     ) -> Result<(usize, SocketAddr)> {
-        let read = self.flush_incoming_buffer(buf);
+        let mut buf = ReadBuf::new(buf);
+        let read = self.flush_incoming_buffer(&mut buf);
 
         if read > 0 {
             Ok((read, self.connected_to))
@@ -352,7 +352,7 @@ impl UtpSocket {
                     return Ok((0, self.connected_to));
                 }
 
-                match self.recv(buf).await {
+                match self.recv(&mut buf).await {
                     Ok((0, _src)) => continue,
                     Ok(x) => return Ok(x),
                     Err(e) => return Err(e),
@@ -361,7 +361,10 @@ impl UtpSocket {
         }
     }
 
-    async fn recv(&mut self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
+    async fn recv(
+        &mut self,
+        buf: &mut ReadBuf<'_>,
+    ) -> Result<(usize, SocketAddr)> {
         let mut b = [0; BUF_SIZE + HEADER_SIZE];
         let start = Instant::now();
         let read;
@@ -538,19 +541,17 @@ impl UtpSocket {
     /// no missing packets. The discarded packets' payload is written to the
     /// slice `buf`, starting in position `start`.
     /// Returns the last written index.
-    fn flush_incoming_buffer(&mut self, buf: &mut [u8]) -> usize {
-        fn unsafe_copy(src: &[u8], dst: &mut [u8]) -> usize {
-            let max_len = min(src.len(), dst.len());
-            unsafe {
-                use std::ptr::copy;
-                copy(src.as_ptr(), dst.as_mut_ptr(), max_len);
-            }
-            max_len
-        }
+    fn flush_incoming_buffer(&mut self, buf: &mut ReadBuf) -> usize {
+        fn copy(src: &[u8], dst: &mut ReadBuf) -> usize {
+            let to_copy = min(src.len(), dst.capacity());
 
+            dst.put_slice(&src[..to_copy]);
+
+            to_copy
+        }
         // Return pending data from a partially read packet
         if !self.pending_data.is_empty() {
-            let flushed = unsafe_copy(&self.pending_data[..], buf);
+            let flushed = copy(&self.pending_data[..], buf);
 
             if flushed == self.pending_data.len() {
                 self.pending_data.clear();
@@ -568,8 +569,7 @@ impl UtpSocket {
                 || self.ack_nr.wrapping_sub(self.incoming_buffer[0].seq_nr())
                     >= 1)
         {
-            let flushed =
-                unsafe_copy(&self.incoming_buffer[0].payload()[..], buf);
+            let flushed = copy(&self.incoming_buffer[0].payload()[..], buf);
 
             if flushed == self.incoming_buffer[0].payload().len() {
                 self.advance_incoming_buffer();
@@ -634,6 +634,8 @@ impl UtpSocket {
     /// Consumes acknowledgements for every pending packet.
     pub async fn flush(&mut self) -> Result<()> {
         let mut buf = [0u8; BUF_SIZE];
+        let mut buf = ReadBuf::new(&mut buf);
+
         while !self.send_window.is_empty() {
             debug!("packets in send window: {}", self.send_window.len());
             self.recv(&mut buf).await?;
@@ -1415,13 +1417,13 @@ impl UtpStream {
     fn handle_driver_notification(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<Result<usize>> {
+        buf: &mut ReadBuf,
+    ) -> Poll<Result<()>> {
         match poll_unpin!(self.receiver.recv(), cx) {
             // either driver sender was dropped or disconnection notice
             Poll::Ready(None) | Poll::Ready(Some(Err(_))) => {
                 debug!("connection driver has died");
-                Poll::Ready(Ok(0))
+                Poll::Ready(Ok(()))
             }
             Poll::Ready(Some(Ok(()))) => {
                 debug!("notification from driver");
@@ -1543,11 +1545,11 @@ where
     Self: Unpin,
 {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context,
-        buf: &mut [u8],
-    ) -> Poll<Result<usize>> {
-        debug!("read poll for {} bytes", buf.len());
+        buf: &mut ReadBuf,
+    ) -> Poll<Result<()>> {
+        debug!("read poll for {} bytes", buf.capacity());
 
         let (read, state) = {
             let mut socket = ready_unpin!(self.socket.lock(), cx);
@@ -1557,10 +1559,10 @@ where
 
         if read > 0 {
             debug!("flushed {} bytes of received data", read);
-            Poll::Ready(Ok(read))
+            Poll::Ready(Ok(()))
         } else if state == SocketState::Closed {
             debug!("read on closed connection");
-            Poll::Ready(Ok(0))
+            Poll::Ready(Ok(()))
         } else if state == SocketState::ResetReceived {
             debug!("read on reset connection");
             Poll::Ready(Err(SocketError::ConnectionReset.into()))
@@ -1723,7 +1725,7 @@ where
 pub struct UtpStreamDriver {
     socket: Arc<Mutex<UtpSocket>>,
     sender: UnboundedSender<Result<()>>,
-    timer: TokioDelay,
+    timer: Pin<Box<Sleep>>,
     timeout_nr: u32,
 }
 
@@ -1735,7 +1737,9 @@ impl UtpStreamDriver {
         Self {
             socket,
             sender,
-            timer: delay_for(Duration::from_millis(INITIAL_CONGESTION_TIMEOUT)),
+            timer: Box::pin(sleep(Duration::from_millis(
+                INITIAL_CONGESTION_TIMEOUT,
+            ))),
             timeout_nr: 0,
         }
     }
@@ -1759,7 +1763,7 @@ impl UtpStreamDriver {
             socket.handle_receive_timeout().await
         };
 
-        self.timer = delay_for(Duration::from_millis(next_timeout));
+        self.reset_timer(Duration::from_millis(next_timeout));
 
         ret
     }
@@ -1794,6 +1798,12 @@ impl UtpStreamDriver {
         }
     }
 
+    fn reset_timer(&mut self, next_timeout: Duration) {
+        let now = TokioInstant::from_std(Instant::now());
+
+        self.timer.as_mut().reset(now + next_timeout);
+    }
+
     fn check_timeout(
         &mut self,
         cx: &mut Context<'_>,
@@ -1805,9 +1815,8 @@ impl UtpStreamDriver {
             match poll_unpin!(self.handle_timeout(next_timeout), cx) {
                 Poll::Pending => todo!("socket buffer full"),
                 Poll::Ready(Ok(())) => {
-                    let now: TokioInstant = Instant::now().into();
+                    self.reset_timer(Duration::from_millis(next_timeout));
 
-                    self.timer.reset(now + Duration::from_millis(next_timeout));
                     ready_unpin!(self.timer, cx);
 
                     Poll::Pending
@@ -1933,8 +1942,8 @@ impl AsyncRead for BufferedUtpStream {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context,
-        buf: &mut [u8],
-    ) -> Poll<Result<usize>> {
+        buf: &mut ReadBuf,
+    ) -> Poll<Result<()>> {
         // bypass buffering when reading since UtpStream already buffers
         self.get_stream().get_pin_mut().poll_read(cx, buf)
     }

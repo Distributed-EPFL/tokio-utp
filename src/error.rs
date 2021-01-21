@@ -30,7 +30,7 @@ impl Error for SocketError {
 
 impl fmt::Display for SocketError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str(self.description())
+        f.write_str(&self.to_string())
     }
 }
 
@@ -45,7 +45,7 @@ impl From<SocketError> for io::Error {
             InvalidReply => ErrorKind::ConnectionRefused,
             Other(_) => ErrorKind::Other,
         };
-        io::Error::new(kind, error.description())
+        io::Error::new(kind, error.to_string())
     }
 }
 
@@ -59,7 +59,7 @@ pub enum ParseError {
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.description())
+        write!(f, "{}", self)
     }
 }
 
@@ -79,6 +79,6 @@ impl Error for ParseError {
 
 impl From<ParseError> for io::Error {
     fn from(error: ParseError) -> io::Error {
-        io::Error::new(ErrorKind::Other, error.description())
+        io::Error::new(ErrorKind::Other, error.to_string())
     }
 }
