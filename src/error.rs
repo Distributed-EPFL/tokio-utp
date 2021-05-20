@@ -13,10 +13,12 @@ pub enum SocketError {
     Other(String),
 }
 
-impl Error for SocketError {
-    fn description(&self) -> &str {
+impl Error for SocketError {}
+
+impl fmt::Display for SocketError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use self::SocketError::*;
-        match *self {
+        let s = match *self {
             ConnectionClosed => "The socket is closed",
             ConnectionReset => "Connection reset by remote peer",
             ConnectionTimedOut => "Connection timed out",
@@ -24,13 +26,9 @@ impl Error for SocketError {
             InvalidReply => "The remote peer sent an invalid reply",
             NotConnected => "The socket is not connected",
             Other(ref s) => s,
-        }
-    }
-}
+        };
 
-impl fmt::Display for SocketError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str(&self.to_string())
+        write!(f, "{}", s)
     }
 }
 
@@ -59,22 +57,21 @@ pub enum ParseError {
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self)
-    }
-}
-
-impl Error for ParseError {
-    fn description(&self) -> &str {
-        use self::ParseError::*;
-        match *self {
+       use self::ParseError::*;
+        let s = match *self {
             InvalidExtensionLength => {
                 "Invalid extension length (must be a non-zero multiple of 4)"
             }
             InvalidPacketLength => "The packet is too small",
             InvalidPacketType(_) => "Invalid packet type",
             UnsupportedVersion => "Unsupported packet version",
-        }
+        };
+
+        write!(f, "{}", s)
     }
+}
+
+impl Error for ParseError {
 }
 
 impl From<ParseError> for io::Error {
