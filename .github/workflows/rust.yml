@@ -30,7 +30,7 @@ jobs:
         name: cargo clippy
         with:
           command: clippy
-          args: --all-features --all-targets -- -D warnings
+          args: --all-features --all-targets
 
       - uses: actions-rs/cargo@v1
         name: cargo test
