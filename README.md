@@ -33,7 +33,7 @@ To use `tokio-utp`, add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tokio-utp = "*"
+async-utp = "*"
 ```
 
 ## Examples
@@ -41,7 +41,7 @@ tokio-utp = "*"
 The simplest example program would be:
 
 ```rust
-use tokio-utp::UtpStream;
+use async_utp::UtpStream;
 use tokio::task;
 use std::io::Write;
 
