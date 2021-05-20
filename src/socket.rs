@@ -2104,6 +2104,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn stream_packet_split() {
         init_logger();
 
@@ -2157,6 +2158,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn stream_closed_write() {
         init_logger();
         let server_addr = next_test_ip4();
@@ -2364,6 +2366,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn stream_flush_then_send() {
         init_logger();
         let server_addr = next_test_ip4();
