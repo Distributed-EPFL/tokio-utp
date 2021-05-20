@@ -15,8 +15,6 @@ use crate::packet::*;
 use crate::time::*;
 use crate::util::*;
 
-use rand;
-
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadBuf};
 use tokio::net::{lookup_host, ToSocketAddrs, UdpSocket};
 use tokio::sync::mpsc::{
@@ -569,7 +567,7 @@ impl UtpSocket {
                 || self.ack_nr.wrapping_sub(self.incoming_buffer[0].seq_nr())
                     >= 1)
         {
-            let flushed = copy(&self.incoming_buffer[0].payload()[..], buf);
+            let flushed = copy(&self.incoming_buffer[0].payload(), buf);
 
             if flushed == self.incoming_buffer[0].payload().len() {
                 self.advance_incoming_buffer();
@@ -1497,8 +1495,8 @@ impl UtpStream {
             let packet = Packet::try_from(&buf[..read])?;
 
             if let Some(reply) = socket.handle_packet(&packet, src)? {
-                if let Poll::Pending =
-                    poll_unpin!(socket.socket.send_to(reply.as_ref(), src), cx)
+                if poll_unpin!(socket.socket.send_to(reply.as_ref(), src), cx)
+                    .is_pending()
                 {
                     socket.unsent_queue.push_back(reply);
                     return Poll::Pending;
@@ -1514,9 +1512,7 @@ impl UtpStream {
         cx: &mut Context<'_>,
     ) -> Poll<Result<()>> {
         while let Some(mut packet) = socket.unsent_queue.pop_front() {
-            if let Poll::Pending =
-                poll_unpin!(socket.send_packet(&mut packet), cx)
-            {
+            if poll_unpin!(socket.send_packet(&mut packet), cx).is_pending() {
                 debug!("too many in flight packets, waiting for ack");
                 return Poll::Pending;
             }
@@ -1597,9 +1593,7 @@ where
                 debug!("send window is full, waiting for ACKs");
                 mem::drop(socket);
 
-                while let Poll::Ready(_) = poll_unpin!(self.receiver.recv(), cx)
-                {
-                }
+                while poll_unpin!(self.receiver.recv(), cx).is_ready() {}
 
                 return Poll::Pending;
             }
@@ -1877,8 +1871,8 @@ impl Future for UtpStreamDriver {
                                     }
                                 }
 
-                                if let Poll::Pending =
-                                    Self::send_reply(&mut socket, reply, cx)
+                                if Self::send_reply(&mut socket, reply, cx)
+                                    .is_pending()
                                 {
                                     return Poll::Pending;
                                 }
@@ -1981,8 +1975,6 @@ mod test {
     use super::*;
     use crate::socket::{SocketState, UtpSocket, BUF_SIZE};
     use crate::time::now_microseconds;
-
-    use rand;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::task;
@@ -2551,17 +2543,19 @@ mod test {
 
         init_logger();
         let server_addr = next_test_ip4();
-        let (mut tx, mut rx) = channel(1);
+        let (tx, mut rx) = channel(1);
 
         let mut server = iotry!(UtpSocket::bind(server_addr));
 
         let handle = task::spawn(async move {
             // Make the server listen for incoming connections
             let mut buf = [0u8; BUF_SIZE];
+            let mut buf = ReadBuf::new(&mut buf);
             let _resp = server.recv(&mut buf).await.unwrap();
             tx.send(server.seq_nr).await.expect("channel closed");
 
             // Close the connection
+            let mut buf = [0; 1500];
             iotry!(server.recv_from(&mut buf));
         });
 
@@ -2851,14 +2845,16 @@ mod test {
         });
 
         let mut buf = [0; BUF_SIZE];
+        let mut buf = ReadBuf::new(&mut buf);
         // Expect SYN
         iotry!(server.recv(&mut buf));
 
         // Receive data
-        let data_packet = match server.socket.recv_from(&mut buf).await {
-            Ok((read, _src)) => Packet::try_from(&buf[..read]).unwrap(),
-            Err(e) => panic!("{}", e),
-        };
+        let data_packet =
+            match server.socket.recv_from(buf.initialized_mut()).await {
+                Ok((_, _src)) => Packet::try_from(buf.filled()).unwrap(),
+                Err(e) => panic!("{}", e),
+            };
         assert_eq!(data_packet.get_type(), PacketType::Data);
         assert_eq!(&data_packet.payload(), &data.as_slice());
         assert_eq!(data_packet.payload().len(), data.len());
@@ -2877,6 +2873,9 @@ mod test {
 
         // Receive data again and check that it's the same we reported as missing
         let client_addr = server.connected_to;
+
+        let mut buf = [0; BUF_SIZE];
+
         match server.socket.recv_from(&mut buf).await {
             Ok((0, _)) => panic!("Received 0 bytes from socket"),
             Ok((read, _src)) => {
@@ -2897,6 +2896,7 @@ mod test {
         }
 
         // Receive close
+        let mut buf = [0; 1500];
         iotry!(server.recv_from(&mut buf));
 
         handle.await.expect("task failure");
@@ -2935,6 +2935,7 @@ mod test {
         });
 
         let mut buf = [0u8; BUF_SIZE];
+        let mut buf = ReadBuf::new(&mut buf);
         server.recv(&mut buf).await.unwrap();
         // After establishing a new connection, the server's ids are a mirror of
         // the client's.
@@ -2948,6 +2949,7 @@ mod test {
         // Purposefully read from UDP socket directly and discard it, in order
         // to behave as if the packet was lost and thus trigger the timeout
         // handling in the *next* call to `UtpSocket.recv_from`.
+        let mut buf = [0; 1500];
         iotry!(server.socket.recv_from(&mut buf));
 
         // Set a much smaller than usual timeout, for quicker test completion
@@ -3049,6 +3051,7 @@ mod test {
             iotry!(client.close());
         });
         let mut buf = [0u8; BUF_SIZE];
+        let mut buf = ReadBuf::new(&mut buf);
         iotry!(server.recv(&mut buf));
         // After establishing a new connection, the server's ids are a mirror of
         // the client's.
@@ -3062,9 +3065,9 @@ mod test {
         let expected: Vec<u8> = vec![1, 2, 3];
         let mut received: Vec<u8> = vec![];
         loop {
-            match server.recv_from(&mut buf).await {
+            match server.recv_from(buf.initialized_mut()).await {
                 Ok((0, _src)) => break,
-                Ok((len, _src)) => received.extend(buf[..len].to_vec()),
+                Ok((_, _src)) => received.extend(buf.filled().to_vec()),
                 Err(e) => panic!("{:?}", e),
             }
         }
@@ -3212,7 +3215,7 @@ mod test {
     async fn test_invalid_packet_on_connect() {
         use tokio::net::UdpSocket;
         let server_addr = next_test_ip4();
-        let mut server = iotry!(UdpSocket::bind(server_addr));
+        let server = iotry!(UdpSocket::bind(server_addr));
 
         let handle = task::spawn(async move {
             match UtpSocket::connect(server_addr).await {
@@ -3237,7 +3240,7 @@ mod test {
     async fn test_receive_unexpected_reply_type_on_connect() {
         use tokio::net::UdpSocket;
         let server_addr = next_test_ip4();
-        let mut server = iotry!(UdpSocket::bind(server_addr));
+        let server = iotry!(UdpSocket::bind(server_addr));
 
         let mut buf = [0; BUF_SIZE];
         let mut packet = Packet::new();
@@ -3289,13 +3292,14 @@ mod test {
         packet.set_ack_nr(client.ack_nr);
         iotry!(client.socket.send_to(packet.as_ref(), server_addr));
         let mut buf = [0; BUF_SIZE];
-        match client.socket.recv_from(&mut buf).await {
-            Ok((len, _src)) => {
-                let reply = Packet::try_from(&buf[..len]).ok().unwrap();
-                assert_eq!(reply.get_type(), PacketType::Reset);
-            }
-            Err(e) => panic!("{:?}", e),
-        }
+
+        let (len, _) = client
+            .socket
+            .recv_from(&mut buf)
+            .await
+            .expect("recv failed");
+        let reply = Packet::try_from(&buf[..len]).ok().unwrap();
+        assert_eq!(reply.get_type(), PacketType::Reset);
         iotry!(client.close());
         handle.await.expect("task failure");
     }
@@ -3308,7 +3312,7 @@ mod test {
         let mut server = iotry!(UtpSocket::bind(server_addr));
 
         let handle = task::spawn(async move {
-            let mut client = iotry!(UtpSocket::connect(server_addr));
+            let client = iotry!(UtpSocket::connect(server_addr));
             let mut packet = Packet::new();
             packet.set_wnd_size(BUF_SIZE as u32);
             packet.set_type(PacketType::Reset);
@@ -3319,10 +3323,11 @@ mod test {
 
             let mut buf = [0; BUF_SIZE];
 
-            match client.socket.recv_from(&mut buf).await {
-                Ok((_len, _src)) => (),
-                Err(e) => panic!("{:?}", e),
-            }
+            client
+                .socket
+                .recv_from(&mut buf)
+                .await
+                .expect("recv failed");
         });
 
         let mut buf = [0; BUF_SIZE];
@@ -3358,6 +3363,7 @@ mod test {
         });
 
         let mut buf = [0; BUF_SIZE];
+        let mut buf = ReadBuf::new(&mut buf);
 
         // Accept connection
         iotry!(server.recv(&mut buf));
@@ -3374,6 +3380,8 @@ mod test {
         // Receive until end
         let mut received: Vec<u8> = vec![];
         loop {
+            let mut buf = [0; BUF_SIZE];
+
             match server.recv_from(&mut buf).await {
                 Ok((0, _src)) => break,
                 Ok((len, _src)) => received.extend(buf[..len].to_vec()),
@@ -3449,6 +3457,7 @@ mod test {
 
             // Wait for a connection to be established
             let mut buf = [0; 1024];
+            let mut buf = ReadBuf::new(&mut buf);
             iotry!(server.recv(&mut buf));
 
             // `peer_addr` should succeed and be equal to the client's address
@@ -3503,6 +3512,7 @@ mod test {
         // Try to receive ACKs, time out too many times on flush, and fail with
         // `TimedOut`
         let mut buf = [0; BUF_SIZE];
+        let mut buf = ReadBuf::new(&mut buf);
         match server.recv(&mut buf).await {
             Err(ref e) if e.kind() == ErrorKind::TimedOut => (),
             x => panic!("Expected Err(TimedOut), got {:?}", x),
